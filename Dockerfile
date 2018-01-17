@@ -19,6 +19,7 @@ RUN set -x \
   && dep ensure \
   && go install \
   && mv $GOPATH/bin/Burrow $GOPATH/bin/burrow \
+  && rm /usr/local/bin/dep \
   && apk del build-dependencies
 
 ADD docker-config /etc/burrow
