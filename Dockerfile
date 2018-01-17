@@ -7,27 +7,19 @@ ENV \
   GODEP_URL=https://github.com/golang/dep/releases/download/v0.3.2/dep-linux-amd64 \
   GODEP_SHA256=322152b8b50b26e5e3a7f6ebaeb75d9c11a747e64bbfd0d8bb1f4d89a031c2b5
 
+ADD . $GOPATH/src/github.com/linkedin/Burrow
+
 RUN set -x \
-  && apk --update --no-cache add --virtual build-dependencies curl ca-certificates \
+  && apk --update --no-cache add --virtual build-dependencies curl ca-certificates git \
   && curl -SLs -o /usr/local/bin/dep "${GODEP_URL}" \
   && sha256sum /usr/local/bin/dep \
   && echo "${GODEP_SHA256}  /usr/local/bin/dep" | sha256sum -c \
   && chmod u+x /usr/local/bin/dep \
+  && cd $GOPATH/src/github.com/linkedin/Burrow \
+  && dep ensure \
+  && go install \
+  && mv $GOPATH/bin/Burrow $GOPATH/bin/burrow \
   && apk del build-dependencies
-
-RUN apk add --no-cache curl bash git ca-certificates wget \
- && update-ca-certificates \
- && curl -sSO https://raw.githubusercontent.com/pote/gpm/v1.4.0/bin/gpm \
- && chmod +x gpm \
- && mv gpm /usr/local/bin
-
-ADD . $GOPATH/src/github.com/linkedin/Burrow
-RUN cd $GOPATH/src/github.com/linkedin/Burrow \
- && dep ensure \
- && gpm install \
- && go install \
- && mv $GOPATH/bin/Burrow $GOPATH/bin/burrow \
- && apk del git curl wget
 
 ADD docker-config /etc/burrow
 
