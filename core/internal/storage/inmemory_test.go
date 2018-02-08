@@ -11,6 +11,8 @@
 package storage
 
 import (
+	"container/ring"
+	"sync"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -33,6 +35,7 @@ func fixtureModule(whitelist string) *InMemoryStorage {
 	viper.Reset()
 	viper.Set("storage.test.class-name", "inmemory")
 	viper.Set("storage.test.group-whitelist", whitelist)
+	viper.Set("storage.test.min-distance", 1)
 
 	return &module
 }
@@ -125,9 +128,11 @@ func TestInMemoryStorage_addBrokerOffset(t *testing.T) {
 	topicList, ok := module.offsets["testcluster"].broker["testtopic"]
 	assert.True(t, ok, "Topic not created")
 	assert.Len(t, topicList, 1, "One partition not created")
-	assert.NotNil(t, topicList[0], "brokerOffset object not created")
-	assert.Equalf(t, int64(4321), topicList[0].Offset, "Expected offset to be 4321, got %v", topicList[0].Offset)
-	assert.Equalf(t, int64(9876), topicList[0].Timestamp, "Expected timestamp to be 9876, got %v", topicList[0].Timestamp)
+	assert.NotNil(t, topicList[0], "brokerOffset ring for p0 not created")
+	assert.NotNil(t, topicList[0].Value, "brokerOffset object for p0 not created")
+	partitonZeroOffset := topicList[0].Value.(*brokerOffset)
+	assert.Equalf(t, int64(4321), partitonZeroOffset.Offset, "Expected offset to be 4321, got %v", partitonZeroOffset.Offset)
+	assert.Equalf(t, int64(9876), partitonZeroOffset.Timestamp, "Expected timestamp to be 9876, got %v", partitonZeroOffset.Timestamp)
 }
 
 func TestInMemoryStorage_addBrokerOffset_ExistingTopic(t *testing.T) {
@@ -153,13 +158,16 @@ func TestInMemoryStorage_addBrokerOffset_ExistingTopic(t *testing.T) {
 	assert.True(t, ok, "Topic not created")
 	assert.Len(t, topicList, 2, "Two partitions not created")
 
-	assert.NotNil(t, topicList[0], "brokerOffset object for p0 not created")
-	assert.Equalf(t, int64(4321), topicList[0].Offset, "Expected offset for p0 to be 4321, got %v", topicList[0].Offset)
-	assert.Equalf(t, int64(9876), topicList[0].Timestamp, "Expected timestamp for p0 to be 9876, got %v", topicList[0].Timestamp)
+	assert.NotNil(t, topicList[0], "brokerOffset ring for p0 not created")
+	assert.NotNil(t, topicList[0].Value, "brokerOffset object for p0 not created")
+	partitonZeroOffset := topicList[0].Value.(*brokerOffset)
+	assert.Equalf(t, int64(4321), partitonZeroOffset.Offset, "Expected offset for p0 to be 4321, got %v", partitonZeroOffset.Offset)
+	assert.Equalf(t, int64(9876), partitonZeroOffset.Timestamp, "Expected timestamp for p0 to be 9876, got %v", partitonZeroOffset.Timestamp)
 
 	assert.NotNil(t, topicList[1], "brokerOffset object for p1 not created")
-	assert.Equalf(t, int64(5432), topicList[1].Offset, "Expected offset for p1 to be 5432, got %v", topicList[1].Offset)
-	assert.Equalf(t, int64(8765), topicList[1].Timestamp, "Expected timestamp for p1 to be 8765, got %v", topicList[1].Timestamp)
+	partitonOneOffset := topicList[1].Value.(*brokerOffset)
+	assert.Equalf(t, int64(5432), partitonOneOffset.Offset, "Expected offset for p1 to be 5432, got %v", partitonOneOffset.Offset)
+	assert.Equalf(t, int64(8765), partitonOneOffset.Timestamp, "Expected timestamp for p1 to be 8765, got %v", partitonOneOffset.Timestamp)
 }
 
 func TestInMemoryStorage_addBrokerOffset_ExistingPartition(t *testing.T) {
@@ -180,9 +188,51 @@ func TestInMemoryStorage_addBrokerOffset_ExistingPartition(t *testing.T) {
 	assert.True(t, ok, "Topic not created")
 	assert.Len(t, topicList, 1, "One partition not created")
 
-	assert.NotNil(t, topicList[0], "brokerOffset object for p0 not created")
-	assert.Equalf(t, int64(5432), topicList[0].Offset, "Expected offset for p0 to be 5432, got %v", topicList[0].Offset)
-	assert.Equalf(t, int64(8765), topicList[0].Timestamp, "Expected timestamp for p0 to be 8765, got %v", topicList[0].Timestamp)
+	assert.NotNil(t, topicList[0], "brokerOffset ring for p0 not created")
+	assert.NotNil(t, topicList[0].Value, "brokerOffset object for p0 not created")
+	partitonZeroOffset := topicList[0].Value.(*brokerOffset)
+	assert.Equalf(t, int64(5432), partitonZeroOffset.Offset, "Expected offset for p0 to be 5432, got %v", partitonZeroOffset.Offset)
+	assert.Equalf(t, int64(8765), partitonZeroOffset.Timestamp, "Expected timestamp for p0 to be 8765, got %v", partitonZeroOffset.Timestamp)
+
+	previousRingItem := topicList[0].Prev()
+	assert.NotNil(t, previousRingItem.Value, "previous brokerOffset object for p0 not created")
+	previousOffset := previousRingItem.Value.(*brokerOffset)
+	assert.Equalf(t, int64(4321), previousOffset.Offset, "Expected offset for p0 to be 4321, got %v", previousOffset.Offset)
+	assert.Equalf(t, int64(9876), previousOffset.Timestamp, "Expected timestamp for p0 to be 9876, got %v", previousOffset.Timestamp)
+}
+
+func TestInMemoryStorage_addBrokerOffset_AddMany(t *testing.T) {
+	module := startWithTestBrokerOffsets("")
+
+	// Add a lot of offsets
+	request := protocol.StorageRequest{
+		RequestType:         protocol.StorageSetBrokerOffset,
+		Cluster:             "testcluster",
+		Topic:               "testtopic",
+		Partition:           0,
+		TopicPartitionCount: 1,
+		Offset:              4321,
+		Timestamp:           9876,
+	}
+	for i := 0; i < 100; i++ {
+		request.Offset = request.Offset + 1
+		request.Timestamp = request.Timestamp + 1
+		module.addBrokerOffset(&request, module.Log)
+	}
+
+	topicList := module.offsets["testcluster"].broker["testtopic"]
+	numOffsets := topicList[0].Len()
+	ringPtr := topicList[0]
+	for i := numOffsets - 1; i >= 0; i-- {
+		ringPtr = ringPtr.Next()
+		assert.NotNilf(t, ringPtr.Value, "Offset %v: brokerOffset object not created", i)
+		val := ringPtr.Value.(*brokerOffset)
+		expectedOffset := request.Offset - int64(i)
+		expectedTimestamp := request.Timestamp - int64(i)
+
+		assert.Equalf(t, expectedOffset, val.Offset, "Offset %v: Expected offset to be %v, got %v", i, expectedOffset, val.Offset)
+		assert.Equalf(t, expectedTimestamp, val.Timestamp, "Offset %v: Expected timestamp to be %v, got %v", i, expectedTimestamp, val.Timestamp)
+	}
 }
 
 func TestInMemoryStorage_addBrokerOffset_BadCluster(t *testing.T) {
@@ -282,11 +332,20 @@ func TestInMemoryStorage_addConsumerOffset(t *testing.T) {
 }
 
 func TestInMemoryStorage_addConsumerOffset_Whitelist(t *testing.T) {
-	module := startWithTestConsumerOffsets("whitelistedgroup", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("whitelistedgroup", startTime)
 
 	// All offsets for the test group should have been dropped
 	_, ok := module.offsets["testcluster"].consumer["testgroup"]
 	assert.False(t, ok, "Group testgroup created when not whitelisted")
+}
+
+func TestInMemoryStorage_addConsumerOffset_TooOld(t *testing.T) {
+	module := startWithTestConsumerOffsets("testgroup", 1000000)
+
+	// All offsets for the test group should have been dropped as they are too old
+	_, ok := module.offsets["testcluster"].consumer["testgroup"]
+	assert.False(t, ok, "Group testgroup created when offsets are too old")
 }
 
 type testset struct {
@@ -330,7 +389,7 @@ func TestInMemoryStorage_addConsumerOffset_MinDistance(t *testing.T) {
 		Group:       "testgroup",
 		Partition:   0,
 		Offset:      2000,
-		Timestamp:   190001,
+		Timestamp:   startTime + 90001,
 	}
 	module.addConsumerOffset(&request, module.Log)
 
@@ -403,7 +462,8 @@ func TestInMemoryStorage_addConsumerOffset_BadCluster(t *testing.T) {
 }
 
 func TestInMemoryStorage_addConsumerOwner(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageSetConsumerOwner,
@@ -424,7 +484,8 @@ func TestInMemoryStorage_addConsumerOwner(t *testing.T) {
 }
 
 func TestInMemoryStorage_deleteTopic(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageSetDeleteTopic,
@@ -441,7 +502,8 @@ func TestInMemoryStorage_deleteTopic(t *testing.T) {
 }
 
 func TestInMemoryStorage_deleteTopic_BadCluster(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageSetDeleteTopic,
@@ -456,7 +518,8 @@ func TestInMemoryStorage_deleteTopic_BadCluster(t *testing.T) {
 }
 
 func TestInMemoryStorage_deleteTopic_NoTopic(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageSetDeleteTopic,
@@ -473,7 +536,8 @@ func TestInMemoryStorage_deleteTopic_NoTopic(t *testing.T) {
 }
 
 func TestInMemoryStorage_deleteGroup(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageSetDeleteGroup,
@@ -487,7 +551,8 @@ func TestInMemoryStorage_deleteGroup(t *testing.T) {
 }
 
 func TestInMemoryStorage_deleteGroup_BadCluster(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageSetDeleteGroup,
@@ -502,7 +567,8 @@ func TestInMemoryStorage_deleteGroup_BadCluster(t *testing.T) {
 }
 
 func TestInMemoryStorage_deleteGroup_NoGroup(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageSetDeleteGroup,
@@ -516,7 +582,8 @@ func TestInMemoryStorage_deleteGroup_NoGroup(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchClusterList(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchClusters,
@@ -537,7 +604,8 @@ func TestInMemoryStorage_fetchClusterList(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchTopicList(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchTopics,
@@ -559,7 +627,8 @@ func TestInMemoryStorage_fetchTopicList(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchTopicList_BadCluster(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchTopics,
@@ -576,7 +645,8 @@ func TestInMemoryStorage_fetchTopicList_BadCluster(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchConsumerList(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchConsumers,
@@ -598,7 +668,8 @@ func TestInMemoryStorage_fetchConsumerList(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchConsumerList_BadCluster(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchConsumers,
@@ -615,7 +686,8 @@ func TestInMemoryStorage_fetchConsumerList_BadCluster(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchTopic(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchTopic,
@@ -638,7 +710,8 @@ func TestInMemoryStorage_fetchTopic(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchTopic_BadCluster(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchTopic,
@@ -656,7 +729,8 @@ func TestInMemoryStorage_fetchTopic_BadCluster(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchTopic_BadTopic(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchTopic,
@@ -727,7 +801,8 @@ func TestInMemoryStorage_fetchConsumer(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchConsumer_BadCluster(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchConsumer,
@@ -745,7 +820,8 @@ func TestInMemoryStorage_fetchConsumer_BadCluster(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchConsumer_BadGroup(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	startTime := (time.Now().Unix() * 1000) - 100000
+	module := startWithTestConsumerOffsets("", startTime)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchConsumer,
@@ -763,7 +839,36 @@ func TestInMemoryStorage_fetchConsumer_BadGroup(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchConsumer_Expired(t *testing.T) {
-	module := startWithTestConsumerOffsets("", 100000)
+	// We can't insert these offsets normally, so we need to mash them into the module
+	module := startWithTestBrokerOffsets("")
+
+	clusterMap := module.offsets["testcluster"]
+	clusterMap.consumerLock.Lock()
+	clusterMap.consumer["testgroup"] = &consumerGroup{
+		lock:   &sync.RWMutex{},
+		topics: make(map[string][]*consumerPartition),
+	}
+	consumerMap := clusterMap.consumer["testgroup"]
+	clusterMap.consumerLock.Unlock()
+
+	consumerMap.lock.Lock()
+	consumerMap.topics["testtopic"] = []*consumerPartition{{offsets: ring.New(module.intervals)}}
+	consumerTopicMap := consumerMap.topics["testtopic"]
+	consumerPartitionRing := consumerTopicMap[0].offsets
+	consumerMap.lock.Unlock()
+
+	for i := 0; i < 10; i++ {
+		offset := uint64(1000 + (i * 100))
+		ts := 1000000 + int64(i*10000)
+
+		consumerPartitionRing.Value = &protocol.ConsumerOffset{
+			Offset:    int64(offset),
+			Timestamp: ts,
+			Lag:       4321 - offset,
+		}
+		consumerMap.lastCommit = ts
+		consumerMap.topics["testtopic"][0].offsets = consumerMap.topics["testtopic"][0].offsets.Next()
+	}
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageFetchConsumer,
